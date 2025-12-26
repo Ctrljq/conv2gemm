@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>卷积变 GEMM 的变形记</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;600;700&display=swap');
+        
+        :root {
+            --bg-primary: #0a0e14;
+            --bg-secondary: #1a1f2e;
+            --bg-tertiary: #252b3b;
+            --accent-cyan: #39c5bb;
+            --accent-orange: #ff9f43;
+            --accent-purple: #a855f7;
+            --accent-pink: #ec4899;
+            --accent-green: #22c55e;
+            --accent-blue: #3b82f6;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --border-color: #334155;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Noto Sans SC', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 40px 20px;
+            background-image: 
+                radial-gradient(ellipse at 20% 20%, rgba(57, 197, 187, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, rgba(168, 85, 247, 0.08) 0%, transparent 50%);
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: var(--text-secondary);
+            margin-bottom: 40px;
+            font-size: 1.1rem;
+        }
+        
+        .section {
+            background: var(--bg-secondary);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .section-title {
+            font-size: 1.4rem;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .step-number {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1rem;
+        }
+        
+        .tensor-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 40px;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        
+        .tensor-box {
+            background: var(--bg-tertiary);
+            border-radius: 12px;
+            padding: 20px;
+            min-width: 200px;
+        }
+        
+        .tensor-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            color: var(--accent-cyan);
+            margin-bottom: 12px;
+            text-align: center;
+        }
+        
+        .tensor-grid {
+            display: grid;
+            gap: 4px;
+            justify-content: center;
+        }
+        
+        .tensor-cell {
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            border-radius: 6px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+        }
+        
+        .tensor-cell:hover {
+            transform: scale(1.15);
+            z-index: 10;
+        }
+        
+        .tensor-cell.highlight {
+            animation: pulse 0.5s ease;
+            box-shadow: 0 0 20px currentColor;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+        }
+        
+        /* Channel colors */
+        .channel-0 { background: rgba(239, 68, 68, 0.3); border: 2px solid #ef4444; color: #fca5a5; }
+        .channel-1 { background: rgba(34, 197, 94, 0.3); border: 2px solid #22c55e; color: #86efac; }
+        .channel-2 { background: rgba(59, 130, 246, 0.3); border: 2px solid #3b82f6; color: #93c5fd; }
+        
+        /* Kernel colors */
+        .kernel-cell { background: rgba(168, 85, 247, 0.4); border: 2px solid #a855f7; color: #d8b4fe; }
+        
+        /* Output colors */
+        .output-cell { background: rgba(255, 159, 67, 0.4); border: 2px solid #ff9f43; color: #fed7aa; }
+        
+        /* Matrix colors */
+        .matrix-cell { background: rgba(57, 197, 187, 0.3); border: 2px solid #39c5bb; color: #a7f3d0; }
+        
+        .arrow {
+            font-size: 3rem;
+            color: var(--accent-purple);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 60px;
+        }
+        
+        .formula-box {
+            background: var(--bg-tertiary);
+            border-radius: 12px;
+            padding: 20px 30px;
+            margin: 20px 0;
+            text-align: center;
+            font-family: 'JetBrains Mono', monospace;
+            border-left: 4px solid var(--accent-purple);
+        }
+        
+        .formula {
+            font-size: 1.2rem;
+            color: var(--accent-cyan);
+        }
+        
+        .explanation {
+            color: var(--text-secondary);
+            line-height: 1.8;
+            margin: 15px 0;
+        }
+        
+        .dimension-info {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            flex-wrap: wrap;
+            margin: 20px 0;
+        }
+        
+        .dim-item {
+            background: var(--bg-tertiary);
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .dim-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        
+        .dim-value {
+            color: var(--accent-orange);
+            font-weight: 600;
+        }
+        
+        .index-legend {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 20px 0;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9rem;
+        }
+        
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+        }
+        
+        .interactive-controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 20px 0;
+        }
+        
+        .control-btn {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            color: white;
+            font-family: 'Noto Sans SC', sans-serif;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .control-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(57, 197, 187, 0.3);
+        }
+        
+        .control-btn.active {
+            background: linear-gradient(135deg, var(--accent-purple), var(--accent-pink));
+        }
+        
+        .im2col-animation {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr auto 1fr;
+            gap: 20px;
+            align-items: center;
+            justify-items: center;
+        }
+        
+        .mapping-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .mapping-table th, .mapping-table td {
+            padding: 12px 16px;
+            text-align: center;
+            border: 1px solid var(--border-color);
+        }
+        
+        .mapping-table th {
+            background: var(--bg-tertiary);
+            color: var(--accent-cyan);
+        }
+        
+        .mapping-table tr:nth-child(even) {
+            background: rgba(57, 197, 187, 0.05);
+        }
+        
+        .highlight-row {
+            background: rgba(168, 85, 247, 0.2) !important;
+        }
+        
+        /* 优化代码块样式 - 修复显示问题 */
+        .code-block {
+            background: #1e1e1e;
+            border-radius: 8px;
+            padding: 24px;
+            margin: 15px 0;
+            overflow-x: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95rem;
+            border: 1px solid var(--border-color);
+            line-height: 1.8; /* 增加行高，避免文字重叠 */
+            white-space: pre; /* 保留空格和换行，确保代码格式正确 */
+        }
+        
+        .code-comment { color: #6a9955 !important; }
+        .code-keyword { color: #569cd6 !important; }
+        .code-string { color: #ce9178 !important; }
+        .code-number { color: #b5cea8 !important; }
+        .code-function { color: #dcdcaa !important; }
+        
+        .nhwc-nchw-compare {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        
+        @media (max-width: 900px) {
+            .nhwc-nchw-compare {
+                grid-template-columns: 1fr;
+            }
+            .im2col-animation {
+                grid-template-columns: 1fr;
+            }
+            .code-block {
+                font-size: 0.85rem; /* 移动端适配代码字体大小 */
+                padding: 18px;
+            }
+        }
+        
+        .memory-layout {
+            display: flex;
+            gap: 2px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin: 15px 0;
+        }
+        
+        .memory-cell {
+            width: 50px;
+            height: 35px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            border-radius: 4px;
+        }
+        
+        .tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+            border: 1px solid var(--border-color);
+            z-index: 100;
+        }
+        
+        .tensor-cell:hover .tooltip {
+            opacity: 1;
+        }
+        
+        .gemm-equation {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin: 30px 0;
+        }
+        
+        .gemm-matrix {
+            text-align: center;
+        }
+        
+        .gemm-matrix-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        
+        .gemm-op {
+            font-size: 2rem;
+            color: var(--accent-purple);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔄 卷积变 GEMM 的变形记</h1>
+        <p class="subtitle">理解 im2col：如何将卷积操作转换为高效的矩阵乘法</p>
+        
+        <!-- 引言 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">0</span>
+                为什么要将卷积变成 GEMM？
+            </div>
+            <p class="explanation">
+                卷积操作本身需要大量的循环和内存随机访问，效率较低。而矩阵乘法 (GEMM - General Matrix Multiplication) 
+                已经被高度优化（BLAS 库、GPU Tensor Core），可以充分利用硬件的并行能力。
+                <strong>im2col</strong> 算法将卷积核的滑动窗口操作转换为矩阵乘法，显著提升计算速度。
+            </p>
+            <div class="formula-box">
+                <div class="formula">卷积 ≈ im2col + GEMM + col2im</div>
+            </div>
+        </div>
+        
+        <!-- NCHW vs NHWC -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">1</span>
+                NCHW vs NHWC 内存布局对比
+            </div>
+            
+            <div class="dimension-info">
+                <div class="dim-item">
+                    <span class="dim-label">N (Batch) = </span>
+                    <span class="dim-value">1</span>
+                </div>
+                <div class="dim-item">
+                    <span class="dim-label">C (Channel) = </span>
+                    <span class="dim-value">3</span>
+                </div>
+                <div class="dim-item">
+                    <span class="dim-label">H (Height) = </span>
+                    <span class="dim-value">4</span>
+                </div>
+                <div class="dim-item">
+                    <span class="dim-label">W (Width) = </span>
+                    <span class="dim-value">4</span>
+                </div>
+            </div>
+            
+            <div class="index-legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #ef4444;"></div>
+                    <span>Channel 0 (R)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #22c55e;"></div>
+                    <span>Channel 1 (G)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #3b82f6;"></div>
+                    <span>Channel 2 (B)</span>
+                </div>
+            </div>
+            
+            <div class="nhwc-nchw-compare">
+                <!-- NCHW -->
+                <div class="tensor-box">
+                    <div class="tensor-label">NCHW (PyTorch 格式)</div>
+                    <p class="explanation" style="font-size: 0.85rem; margin-bottom: 15px;">
+                        先存完一个通道，再存下一个通道<br>
+                        索引公式: <code>n×C×H×W + c×H×W + h×W + w</code>
+                    </p>
+                    <div id="nchw-visual"></div>
+                    <p class="tensor-label" style="margin-top: 15px;">内存线性布局:</p>
+                    <div id="nchw-memory" class="memory-layout"></div>
+                </div>
+                
+                <!-- NHWC -->
+                <div class="tensor-box">
+                    <div class="tensor-label">NHWC (TensorFlow 格式)</div>
+                    <p class="explanation" style="font-size: 0.85rem; margin-bottom: 15px;">
+                        先存完一个像素的所有通道，再存下一个像素<br>
+                        索引公式: <code>n×H×W×C + h×W×C + w×C + c</code>
+                    </p>
+                    <div id="nhwc-visual"></div>
+                    <p class="tensor-label" style="margin-top: 15px;">内存线性布局:</p>
+                    <div id="nhwc-memory" class="memory-layout"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- im2col 过程 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">2</span>
+                im2col: 图像展平为列
+            </div>
+            
+            <p class="explanation">
+                假设我们有一个 <strong>1×3×4×4</strong> 的输入（1个样本，3个通道，4×4大小），
+                使用 <strong>3×3</strong> 的卷积核，stride=1, padding=0。
+                输出尺寸为 <strong>2×2</strong>。
+            </p>
+            
+            <div class="dimension-info">
+                <div class="dim-item">
+                    <span class="dim-label">输入: </span>
+                    <span class="dim-value">1×3×4×4</span>
+                </div>
+                <div class="dim-item">
+                    <span class="dim-label">卷积核: </span>
+                    <span class="dim-value">3×3 (每个输出通道)</span>
+                </div>
+                <div class="dim-item">
+                    <span class="dim-label">输出: </span>
+                    <span class="dim-value">2×2</span>
+                </div>
+            </div>
+            
+            <div class="interactive-controls">
+                <button class="control-btn" onclick="showWindow(0)">窗口 1 (0,0)</button>
+                <button class="control-btn" onclick="showWindow(1)">窗口 2 (0,1)</button>
+                <button class="control-btn" onclick="showWindow(2)">窗口 3 (1,0)</button>
+                <button class="control-btn" onclick="showWindow(3)">窗口 4 (1,1)</button>
+                <button class="control-btn active" onclick="animateAll()">🎬 动画演示</button>
+            </div>
+            
+            <div class="im2col-animation">
+                <!-- 输入张量 -->
+                <div class="tensor-box">
+                    <div class="tensor-label">输入 (3 个通道)</div>
+                    <div id="input-tensor"></div>
+                </div>
+                
+                <div class="arrow">→</div>
+                
+                <!-- im2col 矩阵 -->
+                <div class="tensor-box">
+                    <div class="tensor-label">im2col 矩阵</div>
+                    <div class="tensor-label" style="font-size: 0.75rem; color: var(--text-secondary);">
+                        (C×K×K) × (H_out×W_out) = 27 × 4
+                    </div>
+                    <div id="im2col-matrix"></div>
+                </div>
+                
+                <div class="arrow">×</div>
+                
+                <!-- 卷积核矩阵 -->
+                <div class="tensor-box">
+                    <div class="tensor-label">卷积核展平</div>
+                    <div class="tensor-label" style="font-size: 0.75rem; color: var(--text-secondary);">
+                        已转置: 1 × (C×K×K) = 1 × 27
+                    </div>
+                    <div id="kernel-matrix"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 详细映射表 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">3</span>
+                元素位置映射详解
+            </div>
+            
+            <p class="explanation">
+                下表展示了第一个滑动窗口 (位置 0,0) 中，输入张量的元素如何映射到 im2col 矩阵的对应位置。
+            </p>
+            
+            <table class="mapping-table">
+                <thead>
+                    <tr>
+                        <th>原始位置 (c, h, w)</th>
+                        <th>原始值 (示例)</th>
+                        <th>im2col 行号</th>
+                        <th>im2col 列号</th>
+                        <th>计算公式</th>
+                    </tr>
+                </thead>
+                <tbody id="mapping-tbody">
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- GEMM 计算 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">4</span>
+                GEMM: 矩阵乘法得到输出
+            </div>
+            
+            <div class="gemm-equation">
+                <div class="gemm-matrix">
+                    <div class="gemm-matrix-label">卷积核矩阵 W</div>
+                    <div class="tensor-box" style="display: inline-block;">
+                        <div style="font-family: 'JetBrains Mono'; font-size: 0.8rem;">
+                            [k₀ k₁ ... k₂₆]<br>
+                            <span style="color: var(--text-secondary);">shape: (1, 27)</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="gemm-op">×</div>
+                
+                <div class="gemm-matrix">
+                    <div class="gemm-matrix-label">im2col 矩阵 X</div>
+                    <div class="tensor-box" style="display: inline-block;">
+                        <div style="font-family: 'JetBrains Mono'; font-size: 0.8rem;">
+                            [col₀ col₁ col₂ col₃]<br>
+                            <span style="color: var(--text-secondary);">shape: (27, 4)</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="gemm-op">=</div>
+                
+                <div class="gemm-matrix">
+                    <div class="gemm-matrix-label">输出矩阵 Y</div>
+                    <div class="tensor-box" style="display: inline-block;">
+                        <div style="font-family: 'JetBrains Mono'; font-size: 0.8rem;">
+                            [y₀ y₁ y₂ y₃]<br>
+                            <span style="color: var(--text-secondary);">shape: (1, 4)</span><br>
+                            <span style="color: var(--accent-orange);">→ reshape 为 (1, 1, 2, 2)</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="formula-box">
+                <div class="formula">
+                    Y[out_c, out_h, out_w] = Σ(W[out_c, :] · X[:, out_h×W_out + out_w])
+                </div>
+            </div>
+            
+            <p class="explanation">
+                每个输出位置的值 = 卷积核权重向量 · im2col 对应列的点积。<br>
+                如果有多个输出通道 (out_channels)，卷积核矩阵变为 (out_channels, 27)，输出变为 (out_channels, 4)。
+            </p>
+        </div>
+        
+        <!-- 代码示例 - 修复格式显示问题 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">5</span>
+                PyTorch 代码实现
+            </div>
+            
+            <div class="code-block">
+<span class="code-keyword">import</span> torch
+<span class="code-keyword">import</span> torch.nn.functional <span class="code-keyword">as</span> F
+
+<span class="code-comment"># 输入: NCHW 格式 (batch, channel, height, width)</span>
+x = torch.randn(1, 3, 4, 4)  
+
+<span class="code-comment"># 使用 unfold 实现 im2col (滑动窗口展开)</span>
+<span class="code-comment"># unfold(dimension, kernel_size, stride)</span>
+x_unfold = x.unfold(2, 3, 1).unfold(3, 3, 1)
+<span class="code-comment"># 展开后形状: (1, 3, 2, 2, 3, 3) = (N, C, H_out, W_out, K_h, K_w)</span>
+
+<span class="code-comment"># 重排维度并展平为 im2col 格式</span>
+x_col = x_unfold.permute(0, 1, 4, 5, 2, 3).reshape(1, -1, 4)
+<span class="code-comment"># im2col 形状: (1, 27, 4) = (N, C*K*K, H_out*W_out)</span>
+
+<span class="code-comment"># 卷积核初始化并展平</span>
+weight = torch.randn(1, 3, 3, 3)  <span class="code-comment"># (out_channel, in_channel, K_h, K_w)</span>
+w_col = weight.view(1, -1)        <span class="code-comment"># 展平为: (1, 27)</span>
+
+<span class="code-comment"># GEMM 矩阵乘法 (核心步骤)</span>
+out_col = w_col @ x_col           <span class="code-comment"># 矩阵乘法: (1,1,4) = (1,27) × (1,27,4)</span>
+out = out_col.view(1, 1, 2, 2)    <span class="code-comment"># 重塑为 NCHW 格式输出</span>
+
+<span class="code-comment"># 对比 PyTorch 内置卷积验证正确性</span>
+out_conv = F.conv2d(x, weight)
+diff = (out - out_conv).abs().max()
+print("卷积结果与GEMM结果最大差异:", diff)  <span class="code-comment"># 差异接近0，验证成功</span>
+            </div>
+            
+            <p class="explanation" style="margin-top: 20px;">
+                代码说明：<br>
+                1.  使用 `unfold` 实现滑动窗口展开，替代手动循环，效率更高<br>
+                2.  `permute` 调整维度顺序，将卷积核维度聚合后展平<br>
+                3.  矩阵乘法 `@` 对应 GEMM 操作，是计算核心<br>
+                4.  最终通过 `view` 重塑为卷积输出格式，与内置卷积结果一致
+            </p>
+        </div>
+        
+        <!-- 总结 -->
+        <div class="section">
+            <div class="section-title">
+                <span class="step-number">✓</span>
+                总结
+            </div>
+            
+            <div class="explanation">
+                <p><strong>🔹 NCHW vs NHWC:</strong></p>
+                <ul style="margin: 10px 0 20px 20px;">
+                    <li>NCHW: 通道优先，PyTorch 默认，适合 cuDNN 加速</li>
+                    <li>NHWC: 空间优先，TensorFlow 默认，适合 CPU SIMD 优化</li>
+                </ul>
+                
+                <p><strong>🔹 im2col 核心思想:</strong></p>
+                <ul style="margin: 10px 0 20px 20px;">
+                    <li>将每个滑动窗口展平成 im2col 矩阵的一列</li>
+                    <li>所有通道的窗口值按行排列，矩阵大小: (C × K × K) × (H_out × W_out)</li>
+                    <li>卷积核展平为行向量，大小: (out_channels × C × K × K)</li>
+                </ul>
+                
+                <p><strong>🔹 代价与收益:</strong></p>
+                <ul style="margin: 10px 0 20px 20px;">
+                    <li>代价: 内存占用增加 ~K² 倍（数据复制带来的额外开销）</li>
+                    <li>收益: 利用高度优化的 GEMM 库（BLAS/CUBLAS），整体计算速度大幅提升</li>
+                    <li>现代框架: 混合使用 Winograd、FFT、直接卷积策略，进一步优化性能</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const H = 4, W = 4, C = 3, K = 3;
+        const H_out = H - K + 1, W_out = W - K + 1;
+        
+        // 生成示例数据
+        function generateData() {
+            const data = [];
+            for (let c = 0; c < C; c++) {
+                const channel = [];
+                for (let h = 0; h < H; h++) {
+                    const row = [];
+                    for (let w = 0; w < W; w++) {
+                        row.push(c * 100 + h * 10 + w);
+                    }
+                    channel.push(row);
+                }
+                data.push(channel);
+            }
+            return data;
+        }
+        
+        const inputData = generateData();
+        
+        // 渲染 NCHW 视图
+        function renderNCHW() {
+            const container = document.getElementById('nchw-visual');
+            const memoryContainer = document.getElementById('nchw-memory');
+            let html = '';
+            let memoryHtml = '';
+            let memIdx = 0;
+            
+            for (let c = 0; c < C; c++) {
+                html += `<div class="tensor-label" style="font-size: 0.75rem; margin-top: 10px;">Channel ${c}</div>`;
+                html += `<div class="tensor-grid" style="grid-template-columns: repeat(${W}, 1fr);">`;
+                for (let h = 0; h < H; h++) {
+                    for (let w = 0; w < W; w++) {
+                        const val = inputData[c][h][w];
+                        html += `<div class="tensor-cell channel-${c}" data-c="${c}" data-h="${h}" data-w="${w}">
+                            ${val}
+                            <div class="tooltip">NCHW[0,${c},${h},${w}] = ${val}<br>内存位置: ${memIdx}</div>
+                        </div>`;
+                        memoryHtml += `<div class="memory-cell channel-${c}">${val}</div>`;
+                        memIdx++;
+                    }
+                }
+                html += '</div>';
+            }
+            container.innerHTML = html;
+            memoryContainer.innerHTML = memoryHtml;
+        }
+        
+        // 渲染 NHWC 视图
+        function renderNHWC() {
+            const container = document.getElementById('nhwc-visual');
+            const memoryContainer = document.getElementById('nhwc-memory');
+            let html = '';
+            let memoryHtml = '';
+            let memIdx = 0;
+            
+            html += `<div class="tensor-label" style="font-size: 0.75rem;">每个像素 = [R, G, B]</div>`;
+            html += `<div class="tensor-grid" style="grid-template-columns: repeat(${W}, 1fr);">`;
+            
+            for (let h = 0; h < H; h++) {
+                for (let w = 0; w < W; w++) {
+                    // 显示像素位置
+                    const r = inputData[0][h][w];
+                    const g = inputData[1][h][w];
+                    const b = inputData[2][h][w];
+                    html += `<div class="tensor-cell" style="background: linear-gradient(135deg, rgba(239,68,68,0.3), rgba(34,197,94,0.3), rgba(59,130,246,0.3)); border: 2px solid #888; font-size: 0.65rem;">
+                        (${h},${w})
+                        <div class="tooltip">NHWC[0,${h},${w},:] = [${r},${g},${b}]</div>
+                    </div>`;
+                    
+                    // 内存布局
+                    for (let c = 0; c < C; c++) {
+                        const val = inputData[c][h][w];
+                        memoryHtml += `<div class="memory-cell channel-${c}">${val}</div>`;
+                        memIdx++;
+                    }
+                }
+            }
+            html += '</div>';
+            container.innerHTML = html;
+            memoryContainer.innerHTML = memoryHtml;
+        }
+        
+        // 渲染输入张量 (用于 im2col 演示)
+        function renderInputTensor() {
+            const container = document.getElementById('input-tensor');
+            let html = '';
+            
+            for (let c = 0; c < C; c++) {
+                html += `<div class="tensor-label" style="font-size: 0.7rem; margin-top: 8px;">C${c}</div>`;
+                html += `<div class="tensor-grid" style="grid-template-columns: repeat(${W}, 1fr);">`;
+                for (let h = 0; h < H; h++) {
+                    for (let w = 0; w < W; w++) {
+                        const val = inputData[c][h][w];
+                        html += `<div class="tensor-cell channel-${c}" id="input-${c}-${h}-${w}" style="width: 36px; height: 36px; font-size: 0.7rem;">
+                            ${val}
+                        </div>`;
+                    }
+                }
+                html += '</div>';
+            }
+            container.innerHTML = html;
+        }
+        
+        // 渲染 im2col 矩阵
+        function renderIm2colMatrix() {
+            const container = document.getElementById('im2col-matrix');
+            const rows = C * K * K;  // 27
+            const cols = H_out * W_out;  // 4
+            
+            let html = `<div class="tensor-grid" style="grid-template-columns: repeat(${cols}, 1fr);">`;
+            
+            for (let row = 0; row < rows; row++) {
+                const c = Math.floor(row / (K * K));
+                const kh = Math.floor((row % (K * K)) / K);
+                const kw = row % K;
+                
+                for (let col = 0; col < cols; col++) {
+                    const oh = Math.floor(col / W_out);
+                    const ow = col % W_out;
+                    const h = oh + kh;
+                    const w = ow + kw;
+                    const val = inputData[c][h][w];
+                    
+                    html += `<div class="tensor-cell channel-${c}" id="im2col-${row}-${col}" 
+                        style="width: 32px; height: 20px; font-size: 0.65rem; border-radius: 3px;"
+                        data-src-c="${c}" data-src-h="${h}" data-src-w="${w}">
+                        ${val}
+                    </div>`;
+                }
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
+        // 渲染卷积核矩阵
+        function renderKernelMatrix() {
+            const container = document.getElementById('kernel-matrix');
+            const size = C * K * K;
+            
+            let html = `<div class="tensor-grid" style="grid-template-columns: repeat(9, 1fr);">`;
+            for (let i = 0; i < size; i++) {
+                html += `<div class="tensor-cell kernel-cell" style="width: 28px; height: 28px; font-size: 0.6rem;">
+                    k${i}
+                </div>`;
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
+        // 高亮显示窗口
+        function showWindow(windowIdx) {
+            // 清除所有高亮
+            document.querySelectorAll('.tensor-cell').forEach(el => {
+                el.classList.remove('highlight');
+                el.style.opacity = '0.3';
+            });
+            
+            const oh = Math.floor(windowIdx / W_out);
+            const ow = windowIdx % W_out;
+            
+            // 高亮输入中的窗口
+            for (let c = 0; c < C; c++) {
+                for (let kh = 0; kh < K; kh++) {
+                    for (let kw = 0; kw < K; kw++) {
+                        const h = oh + kh;
+                        const w = ow + kw;
+                        const inputEl = document.getElementById(`input-${c}-${h}-${w}`);
+                        if (inputEl) {
+                            inputEl.style.opacity = '1';
+                            inputEl.classList.add('highlight');
+                        }
+                    }
+                }
+            }
+            
+            // 高亮 im2col 对应的列
+            for (let row = 0; row < C * K * K; row++) {
+                const el = document.getElementById(`im2col-${row}-${windowIdx}`);
+                if (el) {
+                    el.style.opacity = '1';
+                    el.classList.add('highlight');
+                }
+            }
+            
+            // 高亮卷积核
+            document.querySelectorAll('.kernel-cell').forEach(el => {
+                el.style.opacity = '1';
+            });
+        }
+        
+        // 动画演示
+        let animationId = null;
+        function animateAll() {
+            if (animationId) {
+                clearInterval(animationId);
+            }
+            let idx = 0;
+            animationId = setInterval(() => {
+                showWindow(idx);
+                idx = (idx + 1) % (H_out * W_out);
+            }, 1000);
+        }
+        
+        // 生成映射表
+        function generateMappingTable() {
+            const tbody = document.getElementById('mapping-tbody');
+            let html = '';
+            
+            // 第一个窗口 (oh=0, ow=0)
+            let row = 0;
+            for (let c = 0; c < C; c++) {
+                for (let kh = 0; kh < K; kh++) {
+                    for (let kw = 0; kw < K; kw++) {
+                        const h = kh;
+                        const w = kw;
+                        const val = inputData[c][h][w];
+                        const im2colRow = c * K * K + kh * K + kw;
+                        
+                        html += `<tr class="${c === 0 ? 'highlight-row' : ''}">
+                            <td>(${c}, ${h}, ${w})</td>
+                            <td style="color: var(--accent-orange);">${val}</td>
+                            <td>${im2colRow}</td>
+                            <td>0</td>
+                            <td style="font-size: 0.8rem;">${c}×${K}×${K} + ${kh}×${K} + ${kw} = ${im2colRow}</td>
+                        </tr>`;
+                        row++;
+                        if (row >= 9) break;  // 只显示前 9 行，避免表格过长
+                    }
+                    if (row >= 9) break;
+                }
+                if (row >= 9) break;
+            }
+            html += `<tr><td colspan="5" style="color: var(--text-secondary);">... 共 27 行 (3 通道 × 3 × 3 卷积核) ...</td></tr>`;
+            tbody.innerHTML = html;
+        }
+        
+        // 初始化所有视图
+        window.onload = function() {
+            renderNCHW();
+            renderNHWC();
+            renderInputTensor();
+            renderIm2colMatrix();
+            renderKernelMatrix();
+            generateMappingTable();
+            
+            // 默认显示所有元素
+            document.querySelectorAll('.tensor-cell').forEach(el => {
+                el.style.opacity = '1';
+            });
+        }
+    </script>
+</body>
+</html>
